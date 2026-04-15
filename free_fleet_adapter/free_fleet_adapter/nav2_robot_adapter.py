@@ -155,7 +155,10 @@ class Nav2RobotAdapter(RobotAdapter):
             battery_state = SensorMsgs_BatteryState.deserialize(
                 sample.payload.to_bytes()
             )
-            self.battery_soc = battery_state.percentage
+            percentage = battery_state.percentage
+            if percentage > 1.0 and percentage <= 100.0:
+                percentage /= 100.0
+            self.battery_soc = percentage
 
         self.battery_state_sub = self.zenoh_session.declare_subscriber(
             namespacify('battery_state', name),
