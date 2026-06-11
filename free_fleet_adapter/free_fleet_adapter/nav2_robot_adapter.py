@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import importlib
+import json
 from typing import Annotated
 
 from free_fleet.convert import transform_stamped_to_ros2_msg
@@ -49,6 +50,7 @@ import numpy as np
 import rclpy
 import rmf_adapter.easy_full_control as rmf_easy
 from rmf_adapter.robot_update_handle import ActivityIdentifier, Tier
+from std_msgs.msg import String
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 import zenoh
 
@@ -141,6 +143,18 @@ class Nav2RobotAdapter(RobotAdapter):
         self.action_to_plugin_name = {}
         # Maps plugin name to action factory
         self.action_factories = {}
+        self.pending_mission_commands = []
+        self.mission_result_pub = self.node.create_publisher(
+            String,
+            'mission_execution_results',
+            10,
+        )
+        self.mission_command_sub = self.node.create_subscription(
+            String,
+            'mission_execution_commands',
+            self._handle_mission_execution_command,
+            10,
+        )
 
         self.tf_handler = Nav2TfHandler(
             self.name,
@@ -315,6 +329,57 @@ class Nav2RobotAdapter(RobotAdapter):
         ]
         return robot_pose
 
+    def _handle_mission_execution_command(self, msg: String):
+        try:
+            command = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.node.get_logger().warn(
+                f'Invalid mission execution command JSON: {msg.data}'
+            )
+            return
+
+        if command.get('robot_id') != self.name:
+            return
+        if command.get('command_type') != 'move_robot':
+            return
+
+        self.pending_mission_commands.append(command)
+        self.pending_mission_commands = self.pending_mission_commands[-5:]
+
+    def _take_mission_execution_command(self) -> dict | None:
+        if not self.pending_mission_commands:
+            return None
+        return self.pending_mission_commands.pop(0)
+
+    def _publish_mission_execution_result(
+        self,
+        command: dict | None,
+        status: str,
+        source: str,
+        error: str | None = None,
+    ) -> None:
+        if command is None:
+            return
+
+        result = {
+            'mission_id': command.get('mission_id'),
+            'command_id': command.get('command_id'),
+            'task_id': command.get('task_id'),
+            'robot_id': self.name,
+            'target': command.get('target'),
+            'status': status,
+            'source': source,
+        }
+        if error is not None:
+            result['error'] = error
+
+        msg = String()
+        msg.data = json.dumps(result)
+        self.mission_result_pub.publish(msg)
+        self.node.get_logger().info(
+            f'Published mission execution result: {msg.data}'
+        )
+
     def _is_navigation_done(self, nav_handle: ExecutionHandle) -> bool:
         if nav_handle.goal_id is None:
             return True
@@ -324,7 +389,7 @@ class Nav2RobotAdapter(RobotAdapter):
         replies = self.zenoh_session.get(
             namespacify('navigate_to_pose/_action/get_result', self.name),
             payload=req.serialize(),
-            # timeout=0.5
+            timeout=0.5
         )
         for reply in replies:
             try:
@@ -417,6 +482,11 @@ class Nav2RobotAdapter(RobotAdapter):
                 # TODO(ac): Refactor this check as as self._is_navigation_done
                 # takes a while and the execution may have become None due to
                 # task cancellation.
+                self._publish_mission_execution_result(
+                    getattr(exec_handle, 'mission_command', None),
+                    'SUCCEEDED',
+                    'nav2_result',
+                )
                 exec_handle.execution.finished()
                 exec_handle.execution = None
                 # TODO(ac): use an enum to record what type of execution it is,
@@ -532,12 +602,33 @@ class Nav2RobotAdapter(RobotAdapter):
         destination: rmf_easy.Destination,
         execution: rmf_easy.CommandExecution
     ):
+        mission_command = self._take_mission_execution_command()
         self._request_stop(self.exec_handle)
         self.node.get_logger().info(
             f'Commanding [{self.name}] to navigate to {destination.position} '
             f'on map [{destination.map}]'
         )
+        current_pose = self.get_pose()
+        if current_pose is not None and destination.map == self.map_name:
+            distance = np.linalg.norm(
+                np.array(current_pose[:2]) - np.array(destination.position[:2])
+            )
+            if distance < 0.10:
+                self.node.get_logger().info(
+                    f'[{self.name}] already near destination; '
+                    'finishing without an orientation-only Nav2 goal'
+                )
+                self.exec_handle = None
+                self._publish_mission_execution_result(
+                    mission_command,
+                    'SUCCEEDED',
+                    'nav2_already_near_target',
+                )
+                execution.finished()
+                return
+
         self.exec_handle = ExecutionHandle(execution)
+        self.exec_handle.mission_command = mission_command
         self._handle_navigate_to_pose(
             destination.map,
             destination.position[0],

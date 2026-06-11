@@ -19,9 +19,8 @@ import asyncio
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
-from free_fleet_adapter.nav1_robot_adapter import Nav1RobotAdapter
-from free_fleet_adapter.nav2_robot_adapter import Nav2RobotAdapter
 import nudged
 import rclpy
 from rclpy.duration import Duration
@@ -34,6 +33,10 @@ import rmf_adapter.fleet_update_handle as rmf_fleet
 from tf2_ros import Buffer
 import yaml
 import zenoh
+
+if TYPE_CHECKING:
+    from free_fleet_adapter.nav1_robot_adapter import Nav1RobotAdapter
+    from free_fleet_adapter.nav2_robot_adapter import Nav2RobotAdapter
 
 
 # ------------------------------------------------------------------------------
@@ -156,6 +159,8 @@ def start_fleet_adapter(
 
         nav_stack = robot_config_yaml['navigation_stack']
         if nav_stack == 2:
+            from free_fleet_adapter.nav2_robot_adapter import Nav2RobotAdapter
+
             robots[robot_name] = Nav2RobotAdapter(
                 robot_name,
                 robot_config,
@@ -168,6 +173,8 @@ def start_fleet_adapter(
                 tf_buffer
             )
         elif nav_stack == 1:
+            from free_fleet_adapter.nav1_robot_adapter import Nav1RobotAdapter
+
             robots[robot_name] = Nav1RobotAdapter(
                 robot_name,
                 robot_config,
@@ -233,7 +240,7 @@ def parallel(f):
 
 
 @parallel
-def update_robot(robot: Nav1RobotAdapter | Nav2RobotAdapter):
+def update_robot(robot: Any):
     robot_pose = robot.get_pose()
     if robot_pose is None:
         robot.node.get_logger().info(f'Failed to pose of robot [{robot.name}]')
