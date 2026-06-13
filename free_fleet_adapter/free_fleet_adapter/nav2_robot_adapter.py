@@ -132,6 +132,9 @@ class Nav2RobotAdapter(RobotAdapter):
         default_robot_frame = 'base_footprint'
         self.map_frame = self.robot_config_yaml.get('map_frame', default_map_frame)
         self.robot_frame = self.robot_config_yaml.get('robot_frame', default_robot_frame)
+        self.verified_arrival_tolerance_m = float(
+            self.robot_config_yaml.get('verified_arrival_tolerance_m', 0.15)
+        )
 
         # TODO(ac): Only use full battery if sim is indicated
         self.battery_soc = 1.0
@@ -357,6 +360,7 @@ class Nav2RobotAdapter(RobotAdapter):
         status: str,
         source: str,
         error: str | None = None,
+        details: dict | None = None,
     ) -> None:
         if command is None:
             return
@@ -372,6 +376,8 @@ class Nav2RobotAdapter(RobotAdapter):
         }
         if error is not None:
             result['error'] = error
+        if details is not None:
+            result.update(details)
 
         msg = String()
         msg.data = json.dumps(result)
@@ -379,6 +385,57 @@ class Nav2RobotAdapter(RobotAdapter):
         self.node.get_logger().info(
             f'Published mission execution result: {msg.data}'
         )
+
+    def _navigation_result_details(
+        self,
+        target_position: list[float] | None,
+    ) -> dict:
+        details = {
+            'arrival_verified': False,
+            'arrival_tolerance_m': self.verified_arrival_tolerance_m,
+        }
+        current_pose = self.get_pose()
+        if current_pose is not None:
+            details['final_pose'] = current_pose
+        if target_position is not None:
+            details['target_pose'] = target_position
+            if current_pose is not None:
+                details['distance_to_target'] = float(
+                    np.linalg.norm(
+                        np.array(current_pose[:2]) - np.array(target_position[:2])
+                    )
+                )
+                details['arrival_verified'] = (
+                    details['distance_to_target']
+                    <= self.verified_arrival_tolerance_m
+                )
+        return details
+
+    def _handle_unverified_arrival(
+        self,
+        nav_handle: ExecutionHandle,
+        source: str,
+        details: dict,
+    ) -> None:
+        if getattr(nav_handle, 'arrival_verification_reported', False):
+            return
+
+        nav_handle.arrival_verification_reported = True
+        distance = details.get('distance_to_target')
+        self.node.get_logger().warning(
+            f'Navigation result for [{self.name}] was not within verified '
+            f'arrival tolerance [{self.verified_arrival_tolerance_m} m]; '
+            f'distance_to_target={distance}'
+        )
+        self._publish_mission_execution_result(
+            getattr(nav_handle, 'mission_command', None),
+            'FAILED',
+            source,
+            error='arrival_not_verified',
+            details=details,
+        )
+        if self.update_handle is not None:
+            self.update_handle.more().replan()
 
     def _is_navigation_done(self, nav_handle: ExecutionHandle) -> bool:
         if nav_handle.goal_id is None:
@@ -482,10 +539,24 @@ class Nav2RobotAdapter(RobotAdapter):
                 # TODO(ac): Refactor this check as as self._is_navigation_done
                 # takes a while and the execution may have become None due to
                 # task cancellation.
+                details = self._navigation_result_details(
+                    getattr(exec_handle, 'target_position', None),
+                )
+                if not details.get('arrival_verified'):
+                    self._handle_unverified_arrival(
+                        exec_handle,
+                        'nav2_result',
+                        details,
+                    )
+                    activity_identifier = exec_handle.activity
+                    self.update_handle.update(state, activity_identifier)
+                    return
+
                 self._publish_mission_execution_result(
                     getattr(exec_handle, 'mission_command', None),
                     'SUCCEEDED',
                     'nav2_result',
+                    details=details,
                 )
                 exec_handle.execution.finished()
                 exec_handle.execution = None
@@ -609,26 +680,36 @@ class Nav2RobotAdapter(RobotAdapter):
             f'on map [{destination.map}]'
         )
         current_pose = self.get_pose()
+        target_position = list(destination.position)
         if current_pose is not None and destination.map == self.map_name:
             distance = np.linalg.norm(
-                np.array(current_pose[:2]) - np.array(destination.position[:2])
+                np.array(current_pose[:2]) - np.array(target_position[:2])
             )
             if distance < 0.10:
-                self.node.get_logger().info(
-                    f'[{self.name}] already near destination; '
-                    'finishing without an orientation-only Nav2 goal'
-                )
-                self.exec_handle = None
-                self._publish_mission_execution_result(
-                    mission_command,
-                    'SUCCEEDED',
-                    'nav2_already_near_target',
-                )
-                execution.finished()
-                return
+                details = self._navigation_result_details(target_position)
+                if not details.get('arrival_verified'):
+                    self.node.get_logger().info(
+                        f'[{self.name}] is near destination but outside '
+                        'verified arrival tolerance; sending Nav2 goal'
+                    )
+                else:
+                    self.node.get_logger().info(
+                        f'[{self.name}] already near destination; '
+                        'finishing without an orientation-only Nav2 goal'
+                    )
+                    self.exec_handle = None
+                    self._publish_mission_execution_result(
+                        mission_command,
+                        'SUCCEEDED',
+                        'nav2_already_near_target',
+                        details=details,
+                    )
+                    execution.finished()
+                    return
 
         self.exec_handle = ExecutionHandle(execution)
         self.exec_handle.mission_command = mission_command
+        self.exec_handle.target_position = target_position
         self._handle_navigate_to_pose(
             destination.map,
             destination.position[0],
