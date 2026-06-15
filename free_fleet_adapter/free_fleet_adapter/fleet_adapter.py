@@ -60,6 +60,42 @@ def compute_transforms(level, coords, node=None):
     )
 
 
+def load_nav_graph_waypoints(nav_graph_path, reference_coordinates, node=None):
+    """Load named nav graph waypoints in robot map coordinates."""
+
+    with open(nav_graph_path, 'r') as f:
+        nav_graph = yaml.safe_load(f)
+
+    waypoints = {}
+    for level_name, level in nav_graph.get('levels', {}).items():
+        coords = reference_coordinates.get(level_name)
+        if coords is None:
+            continue
+
+        transform = nudged.estimate(coords['rmf'], coords['robot'])
+        level_waypoints = {}
+        for vertex in level.get('vertices', []):
+            if len(vertex) < 3 or not isinstance(vertex[2], dict):
+                continue
+
+            name = vertex[2].get('name')
+            if not name:
+                continue
+
+            x, y = transform.transform([vertex[0], vertex[1]])
+            level_waypoints[name] = [float(x), float(y)]
+
+        waypoints[level_name] = level_waypoints
+
+    if node is not None:
+        count = sum(len(level) for level in waypoints.values())
+        node.get_logger().info(
+            f'Loaded {count} named nav graph waypoints from {nav_graph_path}'
+        )
+
+    return waypoints
+
+
 # ------------------------------------------------------------------------------
 # Fleet adapter
 # ------------------------------------------------------------------------------
@@ -104,6 +140,12 @@ def start_fleet_adapter(
     time.sleep(1.0)
 
     fleet_config.server_uri = server_uri
+
+    waypoint_positions = load_nav_graph_waypoints(
+        nav_graph_path,
+        config_yaml['reference_coordinates'],
+        node,
+    )
 
     # Configure the transforms between robot and RMF frames
     for level, coords in config_yaml['reference_coordinates'].items():
@@ -170,7 +212,8 @@ def start_fleet_adapter(
                 zenoh_session,
                 fleet_handle,
                 fleet_config,
-                tf_buffer
+                tf_buffer,
+                waypoint_positions,
             )
         elif nav_stack == 1:
             from free_fleet_adapter.nav1_robot_adapter import Nav1RobotAdapter

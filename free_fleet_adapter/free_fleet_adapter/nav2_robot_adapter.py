@@ -116,7 +116,8 @@ class Nav2RobotAdapter(RobotAdapter):
         zenoh_session,
         fleet_handle,
         fleet_config: rmf_easy.FleetConfiguration | None,
-        tf_buffer
+        tf_buffer,
+        waypoint_positions: dict | None = None,
     ):
         RobotAdapter.__init__(self, name, node, fleet_handle)
 
@@ -125,6 +126,7 @@ class Nav2RobotAdapter(RobotAdapter):
         self.zenoh_session = zenoh_session
         self.fleet_config = fleet_config
         self.tf_buffer = tf_buffer
+        self.waypoint_positions = waypoint_positions or {}
 
         self.exec_handle: ExecutionHandle | None = None
         self.map_name = self.robot_config_yaml['initial_map']
@@ -133,7 +135,10 @@ class Nav2RobotAdapter(RobotAdapter):
         self.map_frame = self.robot_config_yaml.get('map_frame', default_map_frame)
         self.robot_frame = self.robot_config_yaml.get('robot_frame', default_robot_frame)
         self.verified_arrival_tolerance_m = float(
-            self.robot_config_yaml.get('verified_arrival_tolerance_m', 0.15)
+            self.robot_config_yaml.get('verified_arrival_tolerance_m', 0.12)
+        )
+        self.mission_target_match_tolerance_m = float(
+            self.robot_config_yaml.get('mission_target_match_tolerance_m', 0.25)
         )
 
         # TODO(ac): Only use full battery if sim is indicated
@@ -354,6 +359,46 @@ class Nav2RobotAdapter(RobotAdapter):
             return None
         return self.pending_mission_commands.pop(0)
 
+    def _take_matching_mission_execution_command(
+        self,
+        destination_position: list[float],
+    ) -> dict | None:
+        if not self.pending_mission_commands:
+            return None
+
+        command = self.pending_mission_commands[0]
+        target = command.get('target')
+        target_position = self._waypoint_position(target)
+        if target_position is None:
+            self.node.get_logger().warning(
+                f'[{self.name}] no nav graph pose for mission target '
+                f'[{target}], falling back to FIFO mission command matching'
+            )
+            return self._take_mission_execution_command()
+
+        distance = float(
+            np.linalg.norm(
+                np.array(destination_position[:2]) - np.array(target_position[:2])
+            )
+        )
+        if distance <= self.mission_target_match_tolerance_m:
+            return self.pending_mission_commands.pop(0)
+
+        self.node.get_logger().info(
+            f'[{self.name}] RMF destination {destination_position[:2]} does '
+            f'not match pending mission target [{target}] at '
+            f'{target_position[:2]}; distance={distance:.3f} m. Treating as '
+            'an intermediate navigation leg.'
+        )
+        return None
+
+    def _waypoint_position(self, waypoint_name: str | None) -> list[float] | None:
+        if waypoint_name is None:
+            return None
+
+        level_waypoints = self.waypoint_positions.get(self.map_name, {})
+        return level_waypoints.get(waypoint_name)
+
     def _publish_mission_execution_result(
         self,
         command: dict | None,
@@ -389,11 +434,19 @@ class Nav2RobotAdapter(RobotAdapter):
     def _navigation_result_details(
         self,
         target_position: list[float] | None,
+        mission_command: dict | None = None,
     ) -> dict:
         details = {
             'arrival_verified': False,
             'arrival_tolerance_m': self.verified_arrival_tolerance_m,
         }
+        if mission_command is not None:
+            target = mission_command.get('target')
+            details['mission_target'] = target
+            expected_position = self._waypoint_position(target)
+            if expected_position is not None:
+                details['mission_target_pose'] = expected_position
+                
         current_pose = self.get_pose()
         if current_pose is not None:
             details['final_pose'] = current_pose
@@ -541,8 +594,13 @@ class Nav2RobotAdapter(RobotAdapter):
                 # task cancellation.
                 details = self._navigation_result_details(
                     getattr(exec_handle, 'target_position', None),
+                    getattr(exec_handle, 'mission_command', None),
                 )
-                if not details.get('arrival_verified'):
+                mission_command = getattr(exec_handle, 'mission_command', None)
+                if (
+                    mission_command is not None
+                    and not details.get('arrival_verified')
+                ):
                     self._handle_unverified_arrival(
                         exec_handle,
                         'nav2_result',
@@ -553,7 +611,7 @@ class Nav2RobotAdapter(RobotAdapter):
                     return
 
                 self._publish_mission_execution_result(
-                    getattr(exec_handle, 'mission_command', None),
+                    mission_command,
                     'SUCCEEDED',
                     'nav2_result',
                     details=details,
@@ -673,7 +731,6 @@ class Nav2RobotAdapter(RobotAdapter):
         destination: rmf_easy.Destination,
         execution: rmf_easy.CommandExecution
     ):
-        mission_command = self._take_mission_execution_command()
         self._request_stop(self.exec_handle)
         self.node.get_logger().info(
             f'Commanding [{self.name}] to navigate to {destination.position} '
@@ -681,12 +738,18 @@ class Nav2RobotAdapter(RobotAdapter):
         )
         current_pose = self.get_pose()
         target_position = list(destination.position)
+        mission_command = self._take_matching_mission_execution_command(
+            target_position
+        )
         if current_pose is not None and destination.map == self.map_name:
             distance = np.linalg.norm(
                 np.array(current_pose[:2]) - np.array(target_position[:2])
             )
             if distance < 0.10:
-                details = self._navigation_result_details(target_position)
+                details = self._navigation_result_details(
+                    target_position,
+                    mission_command,
+                )
                 if not details.get('arrival_verified'):
                     self.node.get_logger().info(
                         f'[{self.name}] is near destination but outside '
