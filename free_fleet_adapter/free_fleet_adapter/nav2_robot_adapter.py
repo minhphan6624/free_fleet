@@ -348,11 +348,31 @@ class Nav2RobotAdapter(RobotAdapter):
 
         if command.get('robot_id') != self.name:
             return
-        if command.get('command_type') != 'move_robot':
+
+        command_type = command.get('command_type')
+        if command_type == 'cancel_move':
+            self._handle_mission_cancel_command(command)
+            return
+
+        if command_type != 'move_robot':
             return
 
         self.pending_mission_commands.append(command)
         self.pending_mission_commands = self.pending_mission_commands[-5:]
+
+    def _handle_mission_cancel_command(self, command: dict) -> None:
+        exec_handle = self.exec_handle
+        if exec_handle is None:
+            return
+
+        mission_command = getattr(exec_handle, 'mission_command', None)
+        if mission_command is None:
+            return
+        if mission_command.get('command_id') != command.get('command_id'):
+            return
+
+        exec_handle.cancel_reason = command.get('cancel_reason') or 'CANCELLED'
+        self._request_stop(exec_handle)
 
     def _take_mission_execution_command(self) -> dict | None:
         if not self.pending_mission_commands:
@@ -514,6 +534,7 @@ class Nav2RobotAdapter(RobotAdapter):
                          GoalStatus.STATUS_CANCELING.value:
                         return False
                     case GoalStatus.STATUS_SUCCEEDED.value:
+                        nav_handle.last_result_status = 'SUCCEEDED'
                         self.node.get_logger().info(
                             f'Navigation goal {nav_handle.goal_id} reached'
                         )
@@ -526,6 +547,7 @@ class Nav2RobotAdapter(RobotAdapter):
                             )
                         return True
                     case GoalStatus.STATUS_CANCELED.value:
+                        nav_handle.last_result_status = 'CANCELLED'
                         self.node.get_logger().info(
                             f'Navigation goal {nav_handle.goal_id} was cancelled'
                         )
@@ -597,6 +619,20 @@ class Nav2RobotAdapter(RobotAdapter):
                     getattr(exec_handle, 'mission_command', None),
                 )
                 mission_command = getattr(exec_handle, 'mission_command', None)
+                result_status = getattr(exec_handle, 'last_result_status', None)
+                if result_status == 'CANCELLED':
+                    self._publish_mission_execution_result(
+                        mission_command,
+                        'CANCELLED',
+                        'nav2_result',
+                        error=getattr(exec_handle, 'cancel_reason', 'CANCELLED'),
+                        details=details,
+                    )
+                    exec_handle.execution.finished()
+                    exec_handle.execution = None
+                    self.replan_counts = 0
+                    self.update_handle.update(state, activity_identifier)
+                    return
                 if (
                     mission_command is not None
                     and not details.get('arrival_verified')
