@@ -151,6 +151,7 @@ class Nav2RobotAdapter(RobotAdapter):
         self.action_to_plugin_name = {}
         # Maps plugin name to action factory
         self.action_factories = {}
+        self.operator_paused = False
         self.pending_mission_commands = []
         self.mission_result_pub = self.node.create_publisher(
             String,
@@ -350,6 +351,14 @@ class Nav2RobotAdapter(RobotAdapter):
             return
 
         command_type = command.get('command_type')
+        if command_type == 'pause_robot':
+            self.operator_paused = True
+            return
+
+        if command_type == 'resume_robot':
+            self.operator_paused = False
+            return
+
         if command_type == 'cancel_move':
             self._handle_mission_cancel_command(command)
             return
@@ -362,17 +371,33 @@ class Nav2RobotAdapter(RobotAdapter):
 
     def _handle_mission_cancel_command(self, command: dict) -> None:
         exec_handle = self.exec_handle
-        if exec_handle is None:
-            return
+        command_id = command.get('command_id')
+        reason = command.get('cancel_reason') or 'CANCELLED'
 
-        mission_command = getattr(exec_handle, 'mission_command', None)
-        if mission_command is None:
-            return
-        if mission_command.get('command_id') != command.get('command_id'):
-            return
+        if exec_handle is not None:
+            mission_command = getattr(exec_handle, 'mission_command', None)
+            if (
+                mission_command is not None
+                and mission_command.get('command_id') == command_id
+            ):
+                exec_handle.cancel_reason = reason
+                self._request_stop(exec_handle)
+                return
 
-        exec_handle.cancel_reason = command.get('cancel_reason') or 'CANCELLED'
-        self._request_stop(exec_handle)
+        for index, pending in enumerate(self.pending_mission_commands):
+            if pending.get('command_id') != command_id:
+                continue
+            mission_command = self.pending_mission_commands.pop(index)
+            self._publish_mission_execution_result(
+                mission_command,
+                'CANCELLED',
+                'operator_pause_pending',
+                error=reason,
+            )
+            break
+
+        if self.operator_paused and exec_handle is not None:
+            self._request_stop(exec_handle)
 
     def _take_mission_execution_command(self) -> dict | None:
         if not self.pending_mission_commands:
@@ -777,6 +802,19 @@ class Nav2RobotAdapter(RobotAdapter):
         mission_command = self._take_matching_mission_execution_command(
             target_position
         )
+        if self.operator_paused:
+            self.node.get_logger().info(
+                f'Ignoring navigation command for paused robot [{self.name}]'
+            )
+            self._publish_mission_execution_result(
+                mission_command,
+                'CANCELLED',
+                'operator_pause_guard',
+                error='operator_robot_pause',
+            )
+            execution.finished()
+            return
+
         if current_pose is not None and destination.map == self.map_name:
             distance = np.linalg.norm(
                 np.array(current_pose[:2]) - np.array(target_position[:2])
