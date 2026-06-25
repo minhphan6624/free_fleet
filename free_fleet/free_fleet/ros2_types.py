@@ -178,6 +178,51 @@ class ActionMsgs_CancelGoal_Response(IdlStruct):
     goals_canceling: pycdr2.types.sequence[ActionMsgs_GoalInfo]
 
 
+# https://github.com/ros2/rcl_interfaces/blob/jazzy/rcl_interfaces/msg/ParameterValue.msg
+class ParameterType(Enum):
+    PARAMETER_DOUBLE: pycdr2.types.uint8 = 3
+
+
+@dataclass
+class RclInterfaces_ParameterValue(IdlStruct):
+    type: pycdr2.types.uint8
+    bool_value: bool
+    integer_value: pycdr2.types.int64
+    double_value: pycdr2.types.float64
+    string_value: str
+    byte_array_value: pycdr2.types.sequence[pycdr2.types.uint8]
+    bool_array_value: pycdr2.types.sequence[bool]
+    integer_array_value: pycdr2.types.sequence[pycdr2.types.int64]
+    double_array_value: pycdr2.types.sequence[pycdr2.types.float64]
+    string_array_value: pycdr2.types.sequence[str]
+
+
+# https://github.com/ros2/rcl_interfaces/blob/jazzy/rcl_interfaces/msg/Parameter.msg
+@dataclass
+class RclInterfaces_Parameter(IdlStruct):
+    name: str
+    value: RclInterfaces_ParameterValue
+
+
+# https://github.com/ros2/rcl_interfaces/blob/jazzy/rcl_interfaces/msg/SetParametersResult.msg
+@dataclass
+class RclInterfaces_SetParametersResult(IdlStruct):
+    successful: bool
+    reason: str
+
+
+# https://github.com/ros2/rcl_interfaces/blob/jazzy/rcl_interfaces/srv/SetParameters.srv
+@dataclass
+class SetParameters_Request(IdlStruct):
+    parameters: pycdr2.types.sequence[RclInterfaces_Parameter]
+
+
+# https://github.com/ros2/rcl_interfaces/blob/jazzy/rcl_interfaces/srv/SetParameters.srv
+@dataclass
+class SetParameters_Response(IdlStruct):
+    results: pycdr2.types.sequence[RclInterfaces_SetParametersResult]
+
+
 # https://github.com/ros2/common_interfaces/blob/rolling/sensor_msgs/msg/BatteryState.msg
 @dataclass
 class SensorMsgs_BatteryState(IdlStruct):
