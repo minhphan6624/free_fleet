@@ -31,7 +31,12 @@ from free_fleet.ros2_types import (
     NavigateToPose_GetResult_Response,
     NavigateToPose_SendGoal_Request,
     NavigateToPose_SendGoal_Response,
+    ParameterType,
+    RclInterfaces_Parameter,
+    RclInterfaces_ParameterValue,
     SensorMsgs_BatteryState,
+    SetParameters_Request,
+    SetParameters_Response,
     TFMessage,
     Time,
 )
@@ -135,7 +140,7 @@ class Nav2RobotAdapter(RobotAdapter):
         self.map_frame = self.robot_config_yaml.get('map_frame', default_map_frame)
         self.robot_frame = self.robot_config_yaml.get('robot_frame', default_robot_frame)
         self.verified_arrival_tolerance_m = float(
-            self.robot_config_yaml.get('verified_arrival_tolerance_m', 0.12)
+            self.robot_config_yaml.get('verified_arrival_tolerance_m', 0.15)
         )
         self.mission_target_match_tolerance_m = float(
             self.robot_config_yaml.get('mission_target_match_tolerance_m', 0.25)
@@ -151,6 +156,7 @@ class Nav2RobotAdapter(RobotAdapter):
         self.action_to_plugin_name = {}
         # Maps plugin name to action factory
         self.action_factories = {}
+        self.operator_paused = False
         self.pending_mission_commands = []
         self.mission_result_pub = self.node.create_publisher(
             String,
@@ -350,6 +356,18 @@ class Nav2RobotAdapter(RobotAdapter):
             return
 
         command_type = command.get('command_type')
+        if command_type == 'pause_robot':
+            self.operator_paused = True
+            return
+
+        if command_type == 'resume_robot':
+            self.operator_paused = False
+            return
+
+        if command_type == 'set_speed_scale':
+            self._handle_speed_scale_command(command)
+            return
+
         if command_type == 'cancel_move':
             self._handle_mission_cancel_command(command)
             return
@@ -360,19 +378,107 @@ class Nav2RobotAdapter(RobotAdapter):
         self.pending_mission_commands.append(command)
         self.pending_mission_commands = self.pending_mission_commands[-5:]
 
+    def _handle_speed_scale_command(self, command: dict) -> None:
+        scale = command.get('scale')
+        values = {
+            'FollowPath.desired_linear_vel': 0.25 * scale,
+            'FollowPath.rotate_to_heading_angular_vel': 1.0 * scale,
+            'FollowPath.min_approach_linear_velocity': max(0.02, 0.05 * scale),
+            'FollowPath.regulated_linear_scaling_min_speed': max(0.03, 0.1 * scale),
+        }
+        parameters = [
+            RclInterfaces_Parameter(
+                name=name,
+                value=RclInterfaces_ParameterValue(
+                    type=ParameterType.PARAMETER_DOUBLE.value,
+                    bool_value=False,
+                    integer_value=0,
+                    double_value=value,
+                    string_value='',
+                    byte_array_value=[],
+                    bool_array_value=[],
+                    integer_array_value=[],
+                    double_array_value=[],
+                    string_array_value=[],
+                ),
+            )
+            for name, value in values.items()
+        ]
+        request = SetParameters_Request(parameters=parameters)
+        failure = None
+        response = None
+
+        try:
+            replies = self.zenoh_session.get(
+                namespacify('controller_server/set_parameters', self.name),
+                payload=request.serialize(),
+                timeout=0.5,
+            )
+            for reply in replies:
+                try:
+                    response = SetParameters_Response.deserialize(
+                        reply.ok.payload.to_bytes()
+                    )
+                    break
+                except Exception as err:
+                    failure = str(err)
+        except Exception as err:
+            failure = str(err)
+
+        if response is None:
+            failure = failure or 'no response from controller_server/set_parameters'
+        elif len(response.results) != len(parameters):
+            failure = (
+                f'expected {len(parameters)} parameter results, '
+                f'got {len(response.results)}'
+            )
+        else:
+            rejected = [result.reason for result in response.results if not result.successful]
+            if rejected:
+                failure = '; '.join(reason or 'parameter rejected' for reason in rejected)
+
+        self._publish_mission_execution_result(
+            command,
+            'FAILED' if failure else 'SUCCEEDED',
+            'nav2_set_parameters',
+            error=failure,
+            details={
+                'command_type': 'set_speed_scale',
+                'control_request_id': command.get('control_request_id'),
+                'scale': scale,
+                'parameters': values,
+            },
+        )
+
     def _handle_mission_cancel_command(self, command: dict) -> None:
         exec_handle = self.exec_handle
-        if exec_handle is None:
-            return
+        command_id = command.get('command_id')
+        reason = command.get('cancel_reason') or 'CANCELLED'
 
-        mission_command = getattr(exec_handle, 'mission_command', None)
-        if mission_command is None:
-            return
-        if mission_command.get('command_id') != command.get('command_id'):
-            return
+        if exec_handle is not None:
+            mission_command = getattr(exec_handle, 'mission_command', None)
+            if (
+                mission_command is not None
+                and mission_command.get('command_id') == command_id
+            ):
+                exec_handle.cancel_reason = reason
+                self._request_stop(exec_handle)
+                return
 
-        exec_handle.cancel_reason = command.get('cancel_reason') or 'CANCELLED'
-        self._request_stop(exec_handle)
+        for index, pending in enumerate(self.pending_mission_commands):
+            if pending.get('command_id') != command_id:
+                continue
+            mission_command = self.pending_mission_commands.pop(index)
+            self._publish_mission_execution_result(
+                mission_command,
+                'CANCELLED',
+                'operator_pause_pending',
+                error=reason,
+            )
+            break
+
+        if self.operator_paused and exec_handle is not None:
+            self._request_stop(exec_handle)
 
     def _take_mission_execution_command(self) -> dict | None:
         if not self.pending_mission_commands:
@@ -777,6 +883,19 @@ class Nav2RobotAdapter(RobotAdapter):
         mission_command = self._take_matching_mission_execution_command(
             target_position
         )
+        if self.operator_paused:
+            self.node.get_logger().info(
+                f'Ignoring navigation command for paused robot [{self.name}]'
+            )
+            self._publish_mission_execution_result(
+                mission_command,
+                'CANCELLED',
+                'operator_pause_guard',
+                error='operator_robot_pause',
+            )
+            execution.finished()
+            return
+
         if current_pose is not None and destination.map == self.map_name:
             distance = np.linalg.norm(
                 np.array(current_pose[:2]) - np.array(target_position[:2])
